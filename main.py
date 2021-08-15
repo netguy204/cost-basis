@@ -11,20 +11,30 @@ class Item:
     cost: float
     fees: float
     kind: str
+    date: str
 
     def take_at_most(self, size):
         """return an effective item that represents taking up to size
         from this item. mutates this item to match the transaction"""
         if size >= self.size:
-            result = Item(self.size, self.cost, self.fees)
+            result = Item(
+                size = self.size,
+                cost = self.cost,
+                fees = self.fees,
+                kind = self.kind,
+                date = self.date
+            )
             self.size = 0
             self.cost = 0
             self.fees = 0
         else:
+            # size is less than self
             result = Item(
-                size,
-                self.cost * size / self.size,
-                self.fees * size / self.size,
+                size = size,
+                cost = self.cost * size / self.size,
+                fees = self.fees * size / self.size,
+                kind = self.kind,
+                date = self.date,
             )
             self.size -= result.size
             self.cost -= result.cost
@@ -32,8 +42,10 @@ class Item:
         return result
 
     def rate(self):
-        """items per base currency"""
-        return self.size / (self.cost + self.fees)
+        """base currency per item"""
+        if self.size == 0:
+            return None
+        return self.cost / self.size
 
 
 class Account:
@@ -65,6 +77,7 @@ class Account:
             cost = self.cost(),
             fees = self.fees(),
             kind = self.kind,
+            date = '?',
         )
 
     def withdraw(self, size):
@@ -81,81 +94,90 @@ class Account:
                 self.items.pop(0)
         return result.effective_item()
 
+def group_by(src, fn):
+    match = []
+    for item in src:
+        if not match or fn(match[0]) == fn(item):
+            match.append(item)
+        elif match:
+            yield match
+            match = [item]
+    if match:
+        yield match
+
 def item_adapter(rows):
     inpro_match = []
-    ts = None
+    tid = None
 
     def to_item(inpro_match):
-        usd = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] == 'USD', inpro_match)))
-        fee = next(iter(filter(lambda x: x['type'] == 'fee', inpro_match)))
-        acct = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] != 'USD', inpro_match)))
+        try:
+            usd = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] == 'USD', inpro_match)))
+            acct = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] != 'USD', inpro_match)))
+        except StopIteration:
+            # wtf?
+            #print('badness = {}'.format(inpro_match))
+            return None
+        try:
+            fee = next(iter(filter(lambda x: x['type'] == 'fee', inpro_match)))
+        except StopIteration:
+            # ah, the good old days with no fees
+            fee = {'amount': 0}
 
         item = Item(
             size = abs(float(acct['amount'])),
             cost = abs(float(usd['amount'])),
             fees = abs(float(fee['amount'])),
             kind = acct['amount/balance unit'],
+            date = usd['time'],
         )
         if float(usd['amount']) > 0:
-            # this is a purchase
-            return item
-        else:
             # this is a sale
             return dataclasses.replace(item, size = -item.size)
-
-    for row in rows:
-        if row['type'] in ('match', 'fee'):
-            if ts is None or row['time'] == ts:
-                ts = row['time']
-                inpro_match.append(row)
-            else:
-                raise Exception("{} didn't match expected set {}".format(row, inpro_match))
         else:
-            pass
-            #print("ignoring {}".format(row['type']))
+            # this is a purchase
+            return item
 
-        if len(inpro_match) == 3:
-            yield to_item(inpro_match)
-            inpro_match = []
-            ts = None
-
-    if len(inpro_match) == 3:
-        yield to_item(inpro_match)
-    elif inpro_match:
-        raise Exception("{} didn't have enough matches".format(inpro_match))
-
+    for group in group_by(filter(lambda x: x['trade id'], rows), lambda x: int(x['trade id'])):
+        item = to_item(group)
+        if item:
+            yield item
 
 
 def process(fname):
     with open(fname) as f:
         r = csv.DictReader(f)
         accounts = {}
+        profit = 0
+        fees = 0
         for item in item_adapter(r):
             if item.kind not in accounts:
-                accounts[item.kind] = Account(item.kind)
+                account = Account(item.kind)
+                accounts[item.kind] = account
+            else:
+                account = accounts[item.kind]
             if item.size > 0:
-                accounts[item.kind].deposit(item)
+                account.deposit(item)
             elif item.size < 0:
-                effective = accounts[item.kind].withdraw(item.size)
+                #print(account.items)
+                effective = account.withdraw(abs(item.size))
+                #print(account.items)
                 effective.fees += item.fees
-                print('profit = {}, fees = {}'.format(
-                    item.cost - effective.cost,
-                    effective.fees + item.fees,
+                pprofit = item.cost - effective.cost
+                pfee = effective.fees + item.fees
+                profit += pprofit
+                fees += pfee
+                print('profit = {}, fees = {}, date = {}, purchase = {}, sale = {}'.format(
+                    pprofit,
+                    pfee,
+                    item.date,
+                    effective.rate(),
+                    item.rate(),
                 ))
         print('final cost basis')
         for acct, account in accounts.items():
-            print(account.effective_item())
-
-def test_driver():
-    account = Account('btc')
-    account.deposit(Item(1, 10000, 300, 'btc'))
-    account.deposit(Item(.3, 10000, 200, 'btc'))
-    item = account.effective_item()
-    print(item, item.rate())
-    item = account.withdraw(1.1)
-    print(item, item.rate())
-    item = account.effective_item() 
-    print(item, item.rate())
+            print(account.effective_item(), account.effective_item().rate())
+            #print(account.items)
+        print('total profit: {}, fees: {}'.format(profit, fees))
 
 if __name__ == '__main__':
     process(sys.argv[1])
