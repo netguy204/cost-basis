@@ -5,6 +5,33 @@ import sys
 import dataclasses
 from dataclasses import dataclass
 
+class InfAccount:
+    def __init__(self, kind, basis):
+        self.kind = kind
+        self.basis = basis
+
+    def withdraw(self, size):
+        return Item(
+            size = size,
+            cost = size * self.basis,
+            fees = 0,
+            kind = self.kind,
+            date = '?',
+        )
+
+    def deposit(self, item):
+        pass
+
+    def effective_item(self):
+        return Item(0, 0, 0, self.kind, '?')
+
+@dataclass
+class Transfer:
+    src: str
+    src_size: float
+    dest: str
+    dest_size: float
+
 @dataclass
 class Item:
     size: float
@@ -97,7 +124,13 @@ class Account:
 def group_by(src, fn):
     match = []
     for item in src:
-        if not match or fn(match[0]) == fn(item):
+        item_grp = fn(item)
+        if item_grp is None:
+            if match:
+                yield match
+                match = []
+            yield item
+        elif not match or fn(match[0]) == item_grp:
             match.append(item)
         elif match:
             yield match
@@ -110,24 +143,34 @@ def item_adapter(rows):
     tid = None
 
     def to_item(inpro_match):
-        try:
-            usd = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] == 'USD', inpro_match)))
-            acct = next(iter(filter(lambda x: x['type'] == 'match' and x['amount/balance unit'] != 'USD', inpro_match)))
-        except StopIteration:
-            # wtf?
-            #print('badness = {}'.format(inpro_match))
-            return None
+        src = next(iter(filter(lambda x: x['type'] == 'match' and float(x['amount']) < 0, inpro_match)))
+        dest = next(iter(filter(lambda x: x['type'] == 'match' and float(x['amount']) > 0, inpro_match)))
         try:
             fee = next(iter(filter(lambda x: x['type'] == 'fee', inpro_match)))
         except StopIteration:
             # ah, the good old days with no fees
             fee = {'amount': 0}
 
+        if 'USD' not in (src['amount/balance unit'], dest['amount/balance unit']):
+            return Transfer(
+                src = src['amount/balance unit'].lower(),
+                src_size = abs(float(src['amount'])),
+                dest = dest['amount/balance unit'].lower(),
+                dest_size = abs(float(dest['amount'])),
+            )
+
+        if src['amount/balance unit'] == 'USD':
+            usd = src
+            acct = dest
+        else:
+            acct = src
+            usd = dest
+
         item = Item(
             size = abs(float(acct['amount'])),
             cost = abs(float(usd['amount'])),
             fees = abs(float(fee['amount'])),
-            kind = acct['amount/balance unit'],
+            kind = acct['amount/balance unit'].lower(),
             date = usd['time'],
         )
         if float(usd['amount']) > 0:
@@ -137,24 +180,67 @@ def item_adapter(rows):
             # this is a purchase
             return item
 
-    for group in group_by(filter(lambda x: x['trade id'], rows), lambda x: int(x['trade id'])):
-        item = to_item(group)
-        if item:
-            yield item
+    for group in group_by(rows, trade_id_or_none):
+        if isinstance(group, list):
+            item = to_item(group)
+            if item:
+                yield item
+        elif group['type'] == 'deposit':
+            yield Transfer(
+                src = 'inf_' + group['amount/balance unit'].lower(),
+                src_size = abs(float(group['amount'])),
+                dest = group['amount/balance unit'].lower(),
+                dest_size = abs(float(group['amount'])),
+            )
+        elif group['type'] == 'withdrawal':
+            yield Transfer(
+                src = group['amount/balance unit'].lower(),
+                src_size = abs(float(group['amount'])),
+                dest = 'inf_' + group['amount/balance unit'].lower(),
+                dest_size = abs(float(group['amount'])),
+            )
 
+
+def trade_id_or_none(item):
+    tid = item['trade id']
+    if len(tid) > 0:
+        return int(tid)
+    else:
+        return None
 
 def process(fname):
     with open(fname) as f:
         r = csv.DictReader(f)
-        accounts = {}
+        accounts = {
+            'usd': InfAccount('usd', 1.0),
+            'inf_usd': InfAccount('usd', 1.0),
+            'inf_btc': InfAccount('inf_btc', 0.0),
+            'inf_ltc': InfAccount('inf_ltc', 0.0),
+        }
+        def ensure_account(accounts, kind):
+            if kind not in accounts:
+                account = Account(kind)
+                accounts[kind] = account
+            else:
+                account = accounts[kind]
+            return account
+
         profit = 0
         fees = 0
         for item in item_adapter(r):
-            if item.kind not in accounts:
-                account = Account(item.kind)
-                accounts[item.kind] = account
-            else:
-                account = accounts[item.kind]
+            if isinstance(item, Transfer):
+                src = ensure_account(accounts, item.src)
+                dest = ensure_account(accounts, item.dest)
+                effective_item = src.withdraw(item.src_size)
+                dest.deposit(Item(
+                    size = item.dest_size,
+                    cost = effective_item.cost,
+                    fees = effective_item.fees,
+                    kind = item.dest,
+                    date = '?', # fixme
+                ))
+                continue
+            account = ensure_account(accounts, item.kind)
             if item.size > 0:
                 account.deposit(item)
             elif item.size < 0:
@@ -175,8 +261,8 @@ def process(fname):
                 ))
         print('final cost basis')
         for acct, account in accounts.items():
-            print(account.effective_item(), account.effective_item().rate())
-            #print(account.items)
+            if isinstance(account, Account):
+                print(account.effective_item(), account.effective_item().rate())
         print('total profit: {}, fees: {}'.format(profit, fees))
 
 if __name__ == '__main__':
