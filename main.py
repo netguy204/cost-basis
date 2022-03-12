@@ -149,12 +149,12 @@ def item_adapter(rows):
             fee = next(iter(filter(lambda x: x['type'] == 'fee', inpro_match)))
         except StopIteration:
             # ah, the good old days with no fees
-            fee = {'amount': 0}
+            fee = {'amount': '0'}
 
         if 'USD' not in (src['amount/balance unit'], dest['amount/balance unit']):
             return Transfer(
                 src = src['amount/balance unit'].lower(),
-                src_size = abs(float(src['amount'])),
+                src_size = abs(float(src['amount'])) + abs(float(fee['amount'])),
                 dest = dest['amount/balance unit'].lower(),
                 dest_size = abs(float(dest['amount'])),
             )
@@ -216,6 +216,7 @@ def process(fname):
             'inf_usd': InfAccount('usd', 1.0),
             'inf_btc': InfAccount('inf_btc', 0.0),
             'inf_ltc': InfAccount('inf_ltc', 0.0),
+            'inf_eth': InfAccount('inf_eth', 0.0),
         }
         def ensure_account(accounts, kind):
             if kind not in accounts:
